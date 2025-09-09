@@ -91,10 +91,31 @@ PATHS_HEK <- list(
   H8_HEK = "./H8_HEK/H8_HEK_CogentDS_Analysis_Processed.rds"
 )
 
-OUT_ROOT <- "results"; FIG_ROOT <- "figures"
+OUT_ROOT <- sprintf("%s/results",format(Sys.time(), "%Y%m%d_%H%M")); 
+FIG_ROOT <- sprintf("%s/figures",format(Sys.time(), "%Y%m%d_%H%M")); 
 dir.create(OUT_ROOT, showWarnings = FALSE, recursive = TRUE)
 dir.create(FIG_ROOT, showWarnings = FALSE, recursive = TRUE)
 make_dir <- function(path){ if(!dir.exists(path)) dir.create(path, recursive=TRUE); path }
+
+# ------------------------------ Logging to file --------------------------------
+options(warn = 1)  # show warnings as they occur
+
+LOG_DIR  <- file.path(OUT_ROOT, "logs")
+dir.create(LOG_DIR, showWarnings = FALSE, recursive = TRUE)
+LOG_FILE <- file.path(LOG_DIR, sprintf("pipeline_%s.log",
+                                       format(Sys.time(), "%Y%m%d_%H%M%S")))
+
+# Open a single connection and use it for BOTH output and messages
+log_con <- file(LOG_FILE, open = "wt")     # start a fresh log file
+sink(log_con, split = TRUE)                # stdout -> file (and console)
+sink(log_con, type = "message", split = TRUE)  # messages -> same file (and console)
+
+.run_started_at <- Sys.time()
+log_msg("=== Pipeline started ===")
+log_msg("Log file:", normalizePath(LOG_FILE, mustWork = FALSE))
+log_msg("R:", R.version.string)
+log_msg("Working directory:", normalizePath(getwd(), mustWork = FALSE))
+
 
 # --------------------------- Helpers / Themes ---------------------------------
 resolve_rds <- function(p) {
@@ -405,6 +426,13 @@ if (!is.null(ref) && "celltype" %in% colnames(ref@meta.data)) {
   write_csv(obj_int@meta.data |> tibble::rownames_to_column("cell"),
             file.path(label_dir, "labels_with_scores.csv"))
 } else {
+  #Backup microglial panel, used when Olah et al not available
+  # P2RY12 and TMEM119 are the most microglia-specific in intact brain tissue (human & mouse). TMEM119 was introduced as a highly specific microglial marker by Bennett et al. and repeatedly validated; P2RY12 appears in the core microglial signature from Butovsky et al. 
+  # CX3CR1 is strongly expressed by microglia and often used for lineage/identity (though not exclusive to microglia under all conditions). 
+  # CSF1R is essential for microglial survival and widely used to identify or manipulate microglia (again, not perfectly specific). 
+  # TREM2 is a hallmark microglial receptor, especially in disease-associated microglia (DAM). 
+  # AIF1/IBA1 and ITGAM/CD11b are pan-myeloid markers (microglia + macrophages); they’re included to stabilize the score but aren’t microglia-specific. Reviews consistently note IBA1 as a ubiquitous microglia/macrophage marker and CD11b as commonly used for microglia in flow/IHC. 
+
   mg_markers <- c("CX3CR1","P2RY12","TMEM119","CSF1R","TREM2","AIF1","ITGAM")
   obj_int <- AddModuleScore(obj_int, features=list(mg_markers), name="MG")
   obj_int$MG_Score <- obj_int@meta.data$MG1
@@ -1026,5 +1054,15 @@ save_plot(p_roc, file.path(markers_fig, "roc_glmnet.png"), 6.5, 6.5)
 # --------------------------- OPTIONAL: Bulk RNA-seq ----------------------------
 if (RUN_BULK_OPT){ log_msg("Bulk RNA-seq integration enabled, but no data configured. Skipping.") }
 
-log_msg("Pipeline complete. Outputs in 'results/' and 'figures/'.")
+# ------------------------------ Close logging ----------------------------------
+log_msg("=== Session Info ===")
+print(utils::sessionInfo())
+dur <- difftime(Sys.time(), .run_started_at, units = "mins")
+log_msg(sprintf("=== Pipeline finished (%.1f min) ===", as.numeric(dur)))
+
+# Unsink in the right order, then close the connection
+while (sink.number(type = "message") > 0) sink(NULL, type = "message")
+while (sink.number() > 0) sink(NULL)  # stdout
+try(close(log_con), silent = TRUE)
+
 # =============================================================================
