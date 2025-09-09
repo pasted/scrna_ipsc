@@ -105,10 +105,18 @@ dir.create(LOG_DIR, showWarnings = FALSE, recursive = TRUE)
 LOG_FILE <- file.path(LOG_DIR, sprintf("pipeline_%s.log",
                                        format(Sys.time(), "%Y%m%d_%H%M%S")))
 
-# Open a single connection and use it for BOTH output and messages
-log_con <- file(LOG_FILE, open = "wt")     # start a fresh log file
-sink(log_con, split = TRUE)                # stdout -> file (and console)
-sink(log_con, type = "message", split = TRUE)  # messages -> same file (and console)
+# Clean any previous sinks (defensive)
+while (sink.number(type = "message") > 0) sink(NULL, type = "message")
+while (sink.number() > 0) sink(NULL)
+
+# Open one connection for stdout logging
+log_con <- file(LOG_FILE, open = "wt")
+
+# 1) Stdout -> file AND console
+sink(log_con, split = TRUE)
+
+# 2) Messages -> stdout (which is already split), so they go to both
+sink(stdout(), type = "message")
 
 .run_started_at <- Sys.time()
 log_msg("=== Pipeline started ===")
@@ -1060,9 +1068,10 @@ print(utils::sessionInfo())
 dur <- difftime(Sys.time(), .run_started_at, units = "mins")
 log_msg(sprintf("=== Pipeline finished (%.1f min) ===", as.numeric(dur)))
 
-# Unsink in the right order, then close the connection
+# Unsink message stream then stdout, then close file
 while (sink.number(type = "message") > 0) sink(NULL, type = "message")
-while (sink.number() > 0) sink(NULL)  # stdout
+while (sink.number() > 0) sink(NULL)
 try(close(log_con), silent = TRUE)
+
 
 # =============================================================================
