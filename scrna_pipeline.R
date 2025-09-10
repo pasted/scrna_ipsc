@@ -2,10 +2,10 @@
 # =============================================================================
 # iPSC-microglia scRNA-seq full pipeline
 # Seurat v5: adaptive integration (try SCT, else LogNormalize + RPCA)
-# Dimensionality: PCA, with optional Harmony (chip) via USE_HARMONY flag
-# Pseudobulk DESeq2 -> TWO VARIANTS: labelMG & MGclusters (+ MA & Volcano each)
-# Hallmark GSEA -> TWO VARIANTS
-# GO enrichment -> TWO VARIANTS (H4/H8 top100 + DE up/down)
+# Dimensionality: PCA, optional Harmony (chip) via USE_HARMONY flag
+# DE: Pseudobulk DESeq2 -> TWO VARIANTS: labelMG & MGclusters (+ MA & Volcano)
+# GSEA: Hallmark -> TWO VARIANTS
+# GO:   Top100 H4/H8 + DE up/down -> TWO VARIANTS
 # Add-ons: Label transfer (default), DoubletFinder (opt), SoupX (opt),
 #          Variance partitioning, Subset composition (DirichletReg),
 #          HEK cross-chip diagnostics, Minimal marker panel (glmnet)
@@ -16,6 +16,7 @@ suppressPackageStartupMessages({
   library(Seurat)
   library(harmony)
   library(Matrix)
+  library(Matrix.utils)         # <- NEW: used to collapse duplicate gene symbols
   library(dplyr)
   library(purrr)
   library(ggplot2)
@@ -55,24 +56,10 @@ plan(sequential)
 options(future.globals.maxSize = 8 * 1024^3)  # 8 GB
 
 # ------------------------------ Console-only logging ---------------------------
-reset_sinks <- function() {
-  # stdout
-  for (i in 1:5) {
-    n <- sink.number()
-    if (n <= 0) break
-    ok <- tryCatch({ sink(NULL); TRUE }, error = function(e) FALSE)
-    if (!ok || sink.number() >= n) break
-  }
-  # messages/stderr
-  for (i in 1:5) {
-    n <- sink.number(type = "message")
-    if (n <= 0) break
-    ok <- tryCatch({ sink(NULL, type = "message"); TRUE }, error = function(e) FALSE)
-    if (!ok || sink.number(type = "message") >= n) break
-  }
-}
-reset_sinks()
-options(warn = 1)  # show warnings immediately
+# Ensure nothing is being sunk; print warnings immediately
+while (sink.number(type = "message") > 0) sink(NULL, type = "message")
+while (sink.number() > 0) sink(NULL)
+options(warn = 1)
 
 log_msg <- function(...) {
   cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"),
@@ -223,7 +210,6 @@ RUN_BULK_OPT <- FALSE
 USE_HARMONY <- FALSE  # IMPORTANT: chip is confounded with harvest in this design
 
 # --------------------------- Resolve inputs / audit ----------------------------
-log_msg("Checkpoint A: resolving inputs")
 PATHS     <- lapply(PATHS, resolve_rds)
 PATHS_HEK <- lapply(PATHS_HEK, resolve_rds)
 audit <- tibble::tibble(
@@ -405,17 +391,57 @@ save_plot(p_umap2, file.path(umap_dir, "umap_culture.png"), 7.5, 6.5)
 save_plot(p_umap3, file.path(umap_dir, "umap_chip.png"),    7.5, 6.5)
 save_plot(p_umap_clusters, file.path(umap_dir, "umap_clusters.png"), 8.5, 7)
 
+# --------------------------- Reference prep for label transfer -----------------
+# Convert Olah h5ad -> SCE, collapse Ensembl->SYMBOL (Matrix.utils), build Seurat ref with 'celltype'
+prepare_ref_for_transfer <- function(ref_sce, label_col = c("author_cell_type","cell_type")) {
+  label_col <- match.arg(label_col)
+  stopifnot(inherits(ref_sce, "SingleCellExperiment"))
+  # counts in 'X'
+  if (!"X" %in% SummarizedExperiment::assayNames(ref_sce))
+    stop("No assay 'X' found in ref_sce.")
+  counts <- SummarizedExperiment::assay(ref_sce, "X")
+  # Ensembl -> gene symbol
+  rd <- as.data.frame(SummarizedExperiment::rowData(ref_sce))
+  if (!"feature_name" %in% names(rd))
+    stop("rowData(ref_sce)$feature_name not found.")
+  sym <- as.character(rd$feature_name)
+  sym[!nzchar(sym) | is.na(sym)] <- rownames(ref_sce)
+  # collapse duplicates by summing
+  counts <- Matrix.utils::aggregate.Matrix(x = counts, groupings = sym, fun = "sum")
+  rownames(counts) <- make.unique(rownames(counts))
+  # rebuild SCE with 'counts'
+  sce2 <- SingleCellExperiment::SingleCellExperiment(
+    assays = list(counts = counts),
+    colData = SummarizedExperiment::colData(ref_sce)
+  )
+  # standardise label column to 'celltype'
+  cd <- as.data.frame(SummarizedExperiment::colData(sce2))
+  if (!label_col %in% names(cd))
+    stop("Chosen label_col '", label_col, "' not found in colData.")
+  cd$celltype <- as.character(cd[[label_col]])
+  SummarizedExperiment::colData(sce2) <- S4Vectors::DataFrame(cd)
+  # to Seurat
+  ref <- Seurat::as.Seurat(sce2, counts = "counts")
+  if ("RNA" %in% names(Seurat::Assays(ref))) Seurat::DefaultAssay(ref) <- "RNA"
+  ref
+}
+
 # --------------------------- Label transfer (DEFAULT) --------------------------
 log_msg("Cell identity: label transfer or fallback scoring...")
 label_dir <- make_dir(file.path(OUT_ROOT, "labels"))
 DefaultAssay(obj_int) <- int_assay
 
 get_ref <- function(){
-  if (file.exists("refs/microglia_ref_seurat.rds")) { ref <- readRDS("refs/microglia_ref_seurat.rds"); attr(ref,"type") <- "seurat"; return(ref) }
+  if (file.exists("refs/microglia_ref_seurat.rds")) {
+    ref <- readRDS("refs/microglia_ref_seurat.rds"); attr(ref,"type") <- "seurat"; return(ref)
+  }
   if (have_zell && file.exists("refs/olah_2020_microglia.h5ad")) {
     suppressPackageStartupMessages({ library(zellkonverter); library(SingleCellExperiment) })
     ref_sce <- zellkonverter::readH5AD("refs/olah_2020_microglia.h5ad")
-    ref <- as.Seurat(ref_sce); attr(ref,"type") <- "h5ad"; return(ref)
+    # prefer more granular labels from the paper:
+    ref <- prepare_ref_for_transfer(ref_sce, label_col = "author_cell_type")
+    attr(ref,"type") <- "h5ad_prepared"
+    return(ref)
   }
   NULL
 }
@@ -430,7 +456,7 @@ if (!is.null(ref) && "celltype" %in% colnames(ref@meta.data)) {
   write_csv(obj_int@meta.data |> tibble::rownames_to_column("cell"),
             file.path(label_dir, "labels_with_scores.csv"))
 } else {
-  # Backup microglial panel (derived from widely-used microglia/myeloid markers)
+  # Backup microglial panel when reference not available
   mg_markers <- c("CX3CR1","P2RY12","TMEM119","CSF1R","TREM2","AIF1","ITGAM")
   obj_int <- AddModuleScore(obj_int, features=list(mg_markers), name="MG")
   obj_int$MG_Score <- obj_int@meta.data$MG1
@@ -524,7 +550,6 @@ p_umap_maj <- ggplot2::ggplot(emb, ggplot2::aes(U1, U2, color = seurat_clusters)
     alpha = 0.7, show.legend = FALSE
   ) +
   ggplot2::labs(title = paste0("UMAP • Cluster majority (Olah) labels ", lab_suffix))
-umap_dir <- make_dir(file.path(FIG_ROOT, "UMAP"))
 save_plot(p_umap_maj, file.path(umap_dir, "olah_cluster_majority_labels_on_umap.png"), 9, 7)
 
 # ---------- UMAP: Seurat clusters with H8/H4 composition labels ----------
@@ -817,7 +842,7 @@ if (length(mg_clusters) == 0) {
              con = file.path(de_meta_dir, "clusters_used_in_MGclusters.txt"))
 }
 
-# Keep ORIGINAL as default for any downstream step that expects a single table
+# Keep ORIGINAL as default for downstream steps
 if (!is.null(pb1)) {
   res_tbl_default <- pb1$res_tbl
 } else if (!is.null(pb2)) {
@@ -900,13 +925,11 @@ run_go_variant <- function(cells_subset, res_tbl, tag,
   if (length(down_genes)) invisible(run_go_and_plots(down_genes, paste0("variant_", tag, "/DE_down_in_H8"),universe_symbols))
 }
 
-# Run GO for both variants (only if the variant existed)
-if (!is.null(pb1)) run_go_variant(cells_labelMG,   pb1$res_tbl, "labelMG")
+if (!is.null(pb1)) run_go_variant(cells_labelMG,    pb1$res_tbl, "labelMG")
 if (!is.null(pb2)) run_go_variant(cells_MGclusters, pb2$res_tbl, "MGclusters")
 
 # --------------------------- Variance Partitioning -----------------------------
 log_msg("Variance partitioning: culture vs harvest (pseudobulk voom)...")
-# Use the default pseudobulk matrix if available; rebuild from labelMG cells if not
 if (!is.null(pb1) && !is.null(pb1$pb)) {
   pb_mat <- pb1$pb
   coldata <- tibble(sample=colnames(pb_mat)) |>
@@ -914,7 +937,6 @@ if (!is.null(pb1) && !is.null(pb1$pb)) {
     dplyr::mutate(across(c(culture,harvest), ~ base::as.factor(.x)))
   rownames(coldata) <- coldata$sample
 } else {
-  # fallback
   DefaultAssay(obj_int) <- "RNA"
   md <- obj_int@meta.data |> tibble::as_tibble(rownames="cell")
   cells_fallback <- md |> dplyr::filter(label %in% mg_labels) |> dplyr::pull(cell)
@@ -924,7 +946,6 @@ if (!is.null(pb1) && !is.null(pb1$pb)) {
     dplyr::mutate(across(c(culture,harvest), ~ base::as.factor(.x)))
   rownames(coldata) <- coldata$sample
 }
-
 library(edgeR); library(limma)
 dge <- DGEList(counts=round(pb_mat))
 keep <- filterByExpr(dge, group=coldata$harvest)
@@ -972,10 +993,7 @@ comp_wide$harvest <- base::factor(comp_wide$harvest, levels = c("H4","H8"))
 fit_dir <- DirichletReg::DirichReg(Y ~ harvest, data = comp_wide)
 
 comp_out <- make_dir(file.path(OUT_ROOT, "composition"))
-capture.output(
-  summary(fit_dir),
-  file = file.path(comp_out, "dirichlet_summary.txt")
-)
+sink(file.path(comp_out, "dirichlet_summary.txt")); print(summary(fit_dir)); sink()
 
 top_labels <- subset_prop |>
   dplyr::group_by(label) |>
@@ -1060,5 +1078,4 @@ log_msg("=== Session Info ===")
 print(utils::sessionInfo())
 dur <- difftime(Sys.time(), .run_started_at, units = "mins")
 log_msg(sprintf("=== Pipeline finished (%.1f min) ===", as.numeric(dur)))
-
 # =============================================================================
