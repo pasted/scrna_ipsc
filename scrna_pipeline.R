@@ -54,9 +54,32 @@ conflicted::conflict_prefer("union",     "base")
 plan(sequential)
 options(future.globals.maxSize = 8 * 1024^3)  # 8 GB
 
-# ------------------------------ Logging helper ---------------------------------
-log_msg <- function(...) cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"),
-                                     paste0(..., collapse=" ")))
+# ------------------------------ Console-only logging ---------------------------
+reset_sinks <- function() {
+  # stdout
+  for (i in 1:5) {
+    n <- sink.number()
+    if (n <= 0) break
+    ok <- tryCatch({ sink(NULL); TRUE }, error = function(e) FALSE)
+    if (!ok || sink.number() >= n) break
+  }
+  # messages/stderr
+  for (i in 1:5) {
+    n <- sink.number(type = "message")
+    if (n <= 0) break
+    ok <- tryCatch({ sink(NULL, type = "message"); TRUE }, error = function(e) FALSE)
+    if (!ok || sink.number(type = "message") >= n) break
+  }
+}
+reset_sinks()
+options(warn = 1)  # show warnings immediately
+
+log_msg <- function(...) {
+  cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"),
+              paste0(..., collapse = " ")))
+}
+.run_started_at <- Sys.time()
+log_msg("=== Pipeline started (console only) ===")
 
 # ------------------------------ Working directory ------------------------------
 log_msg("Initial working directory:", normalizePath(getwd(), mustWork = FALSE))
@@ -91,39 +114,11 @@ PATHS_HEK <- list(
   H8_HEK = "./H8_HEK/H8_HEK_CogentDS_Analysis_Processed.rds"
 )
 
-OUT_ROOT <- sprintf("%s/results",format(Sys.time(), "%Y%m%d_%H%M")); 
-FIG_ROOT <- sprintf("%s/figures",format(Sys.time(), "%Y%m%d_%H%M")); 
+OUT_ROOT <- sprintf("%s/results",format(Sys.time(), "%Y%m%d_%H%M"))
+FIG_ROOT <- sprintf("%s/figures",format(Sys.time(), "%Y%m%d_%H%M"))
 dir.create(OUT_ROOT, showWarnings = FALSE, recursive = TRUE)
 dir.create(FIG_ROOT, showWarnings = FALSE, recursive = TRUE)
 make_dir <- function(path){ if(!dir.exists(path)) dir.create(path, recursive=TRUE); path }
-
-# ------------------------------ Logging to file --------------------------------
-options(warn = 1)  # show warnings as they occur
-
-LOG_DIR  <- file.path(OUT_ROOT, "logs")
-dir.create(LOG_DIR, showWarnings = FALSE, recursive = TRUE)
-LOG_FILE <- file.path(LOG_DIR, sprintf("pipeline_%s.log",
-                                       format(Sys.time(), "%Y%m%d_%H%M%S")))
-
-# Clean any previous sinks (defensive)
-while (sink.number(type = "message") > 0) sink(NULL, type = "message")
-while (sink.number() > 0) sink(NULL)
-
-# Open one connection for stdout logging
-log_con <- file(LOG_FILE, open = "wt")
-
-# 1) Stdout -> file AND console
-sink(log_con, split = TRUE)
-
-# 2) Messages -> stdout (which is already split), so they go to both
-sink(stdout(), type = "message")
-
-.run_started_at <- Sys.time()
-log_msg("=== Pipeline started ===")
-log_msg("Log file:", normalizePath(LOG_FILE, mustWork = FALSE))
-log_msg("R:", R.version.string)
-log_msg("Working directory:", normalizePath(getwd(), mustWork = FALSE))
-
 
 # --------------------------- Helpers / Themes ---------------------------------
 resolve_rds <- function(p) {
@@ -228,6 +223,7 @@ RUN_BULK_OPT <- FALSE
 USE_HARMONY <- FALSE  # IMPORTANT: chip is confounded with harvest in this design
 
 # --------------------------- Resolve inputs / audit ----------------------------
+log_msg("Checkpoint A: resolving inputs")
 PATHS     <- lapply(PATHS, resolve_rds)
 PATHS_HEK <- lapply(PATHS_HEK, resolve_rds)
 audit <- tibble::tibble(
@@ -434,13 +430,7 @@ if (!is.null(ref) && "celltype" %in% colnames(ref@meta.data)) {
   write_csv(obj_int@meta.data |> tibble::rownames_to_column("cell"),
             file.path(label_dir, "labels_with_scores.csv"))
 } else {
-  #Backup microglial panel, used when Olah et al not available
-  # P2RY12 and TMEM119 are the most microglia-specific in intact brain tissue (human & mouse). TMEM119 was introduced as a highly specific microglial marker by Bennett et al. and repeatedly validated; P2RY12 appears in the core microglial signature from Butovsky et al. 
-  # CX3CR1 is strongly expressed by microglia and often used for lineage/identity (though not exclusive to microglia under all conditions). 
-  # CSF1R is essential for microglial survival and widely used to identify or manipulate microglia (again, not perfectly specific). 
-  # TREM2 is a hallmark microglial receptor, especially in disease-associated microglia (DAM). 
-  # AIF1/IBA1 and ITGAM/CD11b are pan-myeloid markers (microglia + macrophages); they’re included to stabilize the score but aren’t microglia-specific. Reviews consistently note IBA1 as a ubiquitous microglia/macrophage marker and CD11b as commonly used for microglia in flow/IHC. 
-
+  # Backup microglial panel (derived from widely-used microglia/myeloid markers)
   mg_markers <- c("CX3CR1","P2RY12","TMEM119","CSF1R","TREM2","AIF1","ITGAM")
   obj_int <- AddModuleScore(obj_int, features=list(mg_markers), name="MG")
   obj_int$MG_Score <- obj_int@meta.data$MG1
@@ -982,7 +972,10 @@ comp_wide$harvest <- base::factor(comp_wide$harvest, levels = c("H4","H8"))
 fit_dir <- DirichletReg::DirichReg(Y ~ harvest, data = comp_wide)
 
 comp_out <- make_dir(file.path(OUT_ROOT, "composition"))
-sink(file.path(comp_out, "dirichlet_summary.txt")); print(summary(fit_dir)); sink()
+capture.output(
+  summary(fit_dir),
+  file = file.path(comp_out, "dirichlet_summary.txt")
+)
 
 top_labels <- subset_prop |>
   dplyr::group_by(label) |>
@@ -1067,11 +1060,5 @@ log_msg("=== Session Info ===")
 print(utils::sessionInfo())
 dur <- difftime(Sys.time(), .run_started_at, units = "mins")
 log_msg(sprintf("=== Pipeline finished (%.1f min) ===", as.numeric(dur)))
-
-# Unsink message stream then stdout, then close file
-while (sink.number(type = "message") > 0) sink(NULL, type = "message")
-while (sink.number() > 0) sink(NULL)
-try(close(log_con), silent = TRUE)
-
 
 # =============================================================================
