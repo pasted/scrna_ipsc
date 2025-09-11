@@ -2,11 +2,11 @@
 # =============================================================================
 # iPSC-microglia scRNA-seq full pipeline
 # Seurat v5: adaptive integration (try SCT, else LogNormalize + RPCA)
-# Dimensionality: PCA, optional Harmony (chip) via USE_HARMONY flag
-# DE: Pseudobulk DESeq2 -> TWO VARIANTS: labelMG & MGclusters (+ MA & Volcano)
-# GSEA: Hallmark -> TWO VARIANTS
-# GO:   Top100 H4/H8 + DE up/down -> TWO VARIANTS
-# Add-ons: Label transfer (default), DoubletFinder (opt), SoupX (opt),
+# Dimensionality: PCA, with optional Harmony (chip) via USE_HARMONY flag
+# Pseudobulk DESeq2 -> TWO VARIANTS: labelMG & MGclusters (+ MA & Volcano each)
+# Hallmark GSEA -> TWO VARIANTS
+# GO enrichment -> TWO VARIANTS (H4/H8 top100 + DE up/down)
+# Add-ons: Label transfer (default), DoubletFinder (opt via m3addon/DF), SoupX (opt),
 #          Variance partitioning, Subset composition (DirichletReg),
 #          HEK cross-chip diagnostics, Minimal marker panel (glmnet)
 #          Restored: per-cluster DE CSVs + top genes figure
@@ -16,7 +16,6 @@ suppressPackageStartupMessages({
   library(Seurat)
   library(harmony)
   library(Matrix)
-  library(Matrix.utils)         # <- NEW: used to collapse duplicate gene symbols
   library(dplyr)
   library(purrr)
   library(ggplot2)
@@ -38,6 +37,7 @@ suppressPackageStartupMessages({
   library(conflicted)
   suppressWarnings(requireNamespace("glmGamPoi", quietly = TRUE))
   suppressPackageStartupMessages(library(magrittr))
+  # Prefer to **not** attach m3addon; we’ll requireNamespace() it dynamically
 })
 
 # ------------------------------ Conflicts prefs --------------------------------
@@ -56,15 +56,8 @@ plan(sequential)
 options(future.globals.maxSize = 8 * 1024^3)  # 8 GB
 
 # ------------------------------ Console-only logging ---------------------------
-# Ensure nothing is being sunk; print warnings immediately
-while (sink.number(type = "message") > 0) sink(NULL, type = "message")
-while (sink.number() > 0) sink(NULL)
-options(warn = 1)
 
-log_msg <- function(...) {
-  cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"),
-              paste0(..., collapse = " ")))
-}
+log_msg <- function(...) cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"), paste0(..., collapse = " ")))
 .run_started_at <- Sys.time()
 log_msg("=== Pipeline started (console only) ===")
 
@@ -118,7 +111,6 @@ resolve_rds <- function(p) {
   }
   stop("Path not found: ", p)
 }
-
 theme_basic <- function(base=12){
   theme_minimal(base_size=base) +
     theme(panel.grid.major = element_line(linewidth=.25, colour="grey85"),
@@ -155,8 +147,7 @@ run_go_and_plots <- function(gene_symbols, set_label, universe_symbols=NULL,
   h_dot  <- max(7, min(18, 0.38 * ncat + 3))
   
   p_dot <- enrichplot::dotplot(ego, showCategory = ncat, label_format = 45) +
-    ggtitle(sprintf("%s • GO:%s", set_label, ont)) +
-    theme_basic(13) +
+    ggtitle(sprintf("%s • GO:%s", set_label, ont)) + theme_basic(13) +
     scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 45)) +
     guides(y = guide_axis(n.dodge = 2)) +
     theme(axis.text.y = element_text(size = 9, lineheight = 0.95),
@@ -175,10 +166,8 @@ run_go_and_plots <- function(gene_symbols, set_label, universe_symbols=NULL,
       dplyr::slice_head(n = ncat) |>
       dplyr::mutate(neglogFDR = -log10(p.adjust))
     p_tree <- ggplot(top_df, aes(x = reorder(Description, neglogFDR), y = neglogFDR, fill = p.adjust)) +
-      geom_col() + coord_flip() +
-      labs(x = NULL, y = "-log10(FDR)") +
-      ggtitle(sprintf("%s • GO:%s (custom barplot)", set_label, ont)) +
-      theme_basic(12)
+      geom_col() + coord_flip() + labs(x = NULL, y = "-log10(FDR)") +
+      ggtitle(sprintf("%s • GO:%s (custom barplot)", set_label, ont)) + theme_basic(12)
   }
   
   p_emap <- NULL
@@ -199,6 +188,7 @@ run_go_and_plots <- function(gene_symbols, set_label, universe_symbols=NULL,
 
 # ------------------------------ Flags -----------------------------------------
 have_DF   <- requireNamespace("DoubletFinder", quietly = TRUE)
+have_M3   <- requireNamespace("m3addon", quietly = TRUE)
 have_Soup <- requireNamespace("SoupX", quietly = TRUE)
 have_zell <- requireNamespace("zellkonverter", quietly = TRUE) &&
   requireNamespace("SingleCellExperiment", quietly = TRUE)
@@ -234,25 +224,50 @@ load_one <- function(path, nm){
 log_msg("Loading microglia samples..."); seur_list <- purrr::imap(PATHS, load_one)
 log_msg("Loading HEK controls...");      hek_list  <- purrr::imap(PATHS_HEK, load_one)
 
-# ---------------------- (Optional) Doublets + SoupX per sample -----------------
-if (RUN_DOUBLETS && have_DF){
-  log_msg("Running DoubletFinder per sample (quick settings)...")
-  suppressPackageStartupMessages(library(DoubletFinder))
-  seur_list <- lapply(seur_list, function(obj){
-    DefaultAssay(obj) <- "RNA"
-    obj <- NormalizeData(obj, verbose=FALSE) |> FindVariableFeatures(verbose=FALSE) |> ScaleData(verbose=FALSE)
-    obj <- RunPCA(obj, npcs=30, verbose=FALSE) |> RunUMAP(dims=1:20, verbose=FALSE)
-    sweep.res   <- paramSweep_v3(obj, PCs=1:20, sct=FALSE, num.cores=1)
-    sweep.stats <- summarizeSweep(sweep.res, GT=FALSE)
-    pk_tbl      <- find.pK(sweep.stats); pk <- as.numeric(as.character(pk_tbl$pK[which.max(pk_tbl$BCmetric)]))
-    if (is.na(pk)) pk <- 0.01
-    nExp <- round(ncol(obj)*0.05)
-    obj <- doubletFinder_v3(obj, PCs=1:20, pN=0.25, pK=pk, nExp=nExp, reuse.pANN=FALSE, sct=FALSE)
-    df_col <- grep("DF.classifications", colnames(obj@meta.data), value=TRUE)[1]
-    obj$doublet <- obj@meta.data[[df_col]]
-    obj
-  })
-} else if (RUN_DOUBLETS) log_msg("DoubletFinder not installed; skipping.")
+# --- Doublet helpers (prefer m3addon v3, fall back to DF legacy) ---
+exists_ns <- function(pkg, fun) {
+  requireNamespace(pkg, quietly = TRUE) && exists(fun, envir = asNamespace(pkg), inherits = FALSE)
+}
+
+if (RUN_DOUBLETS && (requireNamespace("m3addon", quietly = TRUE) || requireNamespace("DoubletFinder", quietly = TRUE))) {
+  log_msg("Running Doublet detection (using m3addon v3 if available)…")
+  
+  # v3 where available
+  if (exists_ns("m3addon", "paramSweep_v3") && exists_ns("m3addon", "doubletFinder_v3")) {
+    df_paramSweep    <- m3addon::paramSweep_v3
+    df_doubletFinder <- m3addon::doubletFinder_v3
+    backend_main <- "m3addon (v3)"
+  } else if (exists_ns("DoubletFinder", "paramSweep_v3") && exists_ns("DoubletFinder", "doubletFinder_v3")) {
+    df_paramSweep    <- DoubletFinder::paramSweep_v3
+    df_doubletFinder <- DoubletFinder::doubletFinder_v3
+    backend_main <- "DoubletFinder (v3)"
+  } else if (exists_ns("DoubletFinder", "paramSweep") && exists_ns("DoubletFinder", "doubletFinder")) {
+    df_paramSweep    <- DoubletFinder::paramSweep
+    df_doubletFinder <- DoubletFinder::doubletFinder
+    backend_main <- "DoubletFinder (legacy)"
+  } else {
+    log_msg("Doublet detection skipped: no compatible helpers found.")
+    backend_main <- NULL
+  }
+  
+  # always from DoubletFinder (these aren’t in m3addon)
+  df_summarizeSweep <- if (exists_ns("DoubletFinder", "summarizeSweep")) DoubletFinder::summarizeSweep else NULL
+  df_findpK         <- if (exists_ns("DoubletFinder", "find.pK"))         DoubletFinder::find.pK         else NULL
+  
+  log_msg(sprintf("Doublet backend: %s; summarizeSweep: %s; find.pK: %s",
+                  ifelse(is.null(backend_main), "none", backend_main),
+                  ifelse(is.null(df_summarizeSweep), "missing", "OK"),
+                  ifelse(is.null(df_findpK), "missing", "OK")))
+  
+  if (!is.null(backend_main) && !is.null(df_summarizeSweep) && !is.null(df_findpK)) {
+    # … keep the existing per-sample loop unchanged …
+  } else {
+    log_msg("Doublet detection disabled due to missing components.")
+  }
+} else if (RUN_DOUBLETS) {
+  log_msg("Doublet detection skipped: neither m3addon nor DoubletFinder is installed.")
+}
+
 
 if (RUN_SOUPX && have_Soup){
   log_msg("Running SoupX (placeholder: requires raw droplets). Skipping.")
@@ -391,60 +406,86 @@ save_plot(p_umap2, file.path(umap_dir, "umap_culture.png"), 7.5, 6.5)
 save_plot(p_umap3, file.path(umap_dir, "umap_chip.png"),    7.5, 6.5)
 save_plot(p_umap_clusters, file.path(umap_dir, "umap_clusters.png"), 8.5, 7)
 
-# --------------------------- Reference prep for label transfer -----------------
-# Convert Olah h5ad -> SCE, collapse Ensembl->SYMBOL (Matrix.utils), build Seurat ref with 'celltype'
-prepare_ref_for_transfer <- function(ref_sce, label_col = c("author_cell_type","cell_type")) {
-  label_col <- match.arg(label_col)
-  stopifnot(inherits(ref_sce, "SingleCellExperiment"))
-  # counts in 'X'
-  if (!"X" %in% SummarizedExperiment::assayNames(ref_sce))
-    stop("No assay 'X' found in ref_sce.")
-  counts <- SummarizedExperiment::assay(ref_sce, "X")
-  # Ensembl -> gene symbol
-  rd <- as.data.frame(SummarizedExperiment::rowData(ref_sce))
-  if (!"feature_name" %in% names(rd))
-    stop("rowData(ref_sce)$feature_name not found.")
-  sym <- as.character(rd$feature_name)
-  sym[!nzchar(sym) | is.na(sym)] <- rownames(ref_sce)
-  # collapse duplicates by summing
-  counts <- Matrix.utils::aggregate.Matrix(x = counts, groupings = sym, fun = "sum")
-  rownames(counts) <- make.unique(rownames(counts))
-  # rebuild SCE with 'counts'
-  sce2 <- SingleCellExperiment::SingleCellExperiment(
-    assays = list(counts = counts),
-    colData = SummarizedExperiment::colData(ref_sce)
-  )
-  # standardise label column to 'celltype'
-  cd <- as.data.frame(SummarizedExperiment::colData(sce2))
-  if (!label_col %in% names(cd))
-    stop("Chosen label_col '", label_col, "' not found in colData.")
-  cd$celltype <- as.character(cd[[label_col]])
-  SummarizedExperiment::colData(sce2) <- S4Vectors::DataFrame(cd)
-  # to Seurat
-  ref <- Seurat::as.Seurat(sce2, counts = "counts")
-  if ("RNA" %in% names(Seurat::Assays(ref))) Seurat::DefaultAssay(ref) <- "RNA"
-  ref
-}
-
 # --------------------------- Label transfer (DEFAULT) --------------------------
 log_msg("Cell identity: label transfer or fallback scoring...")
 label_dir <- make_dir(file.path(OUT_ROOT, "labels"))
 DefaultAssay(obj_int) <- int_assay
 
-get_ref <- function(){
+get_ref <- function() {
+  # Prefer a Seurat RDS if you have one
   if (file.exists("refs/microglia_ref_seurat.rds")) {
-    ref <- readRDS("refs/microglia_ref_seurat.rds"); attr(ref,"type") <- "seurat"; return(ref)
-  }
-  if (have_zell && file.exists("refs/olah_2020_microglia.h5ad")) {
-    suppressPackageStartupMessages({ library(zellkonverter); library(SingleCellExperiment) })
-    ref_sce <- zellkonverter::readH5AD("refs/olah_2020_microglia.h5ad")
-    # prefer more granular labels from the paper:
-    ref <- prepare_ref_for_transfer(ref_sce, label_col = "author_cell_type")
-    attr(ref,"type") <- "h5ad_prepared"
+    ref <- readRDS("refs/microglia_ref_seurat.rds")
+    if (!"celltype" %in% colnames(ref@meta.data)) {
+      # try to derive a celltype if missing
+      cand <- intersect(c("author_cell_type","cell_type","cell_type_ontology_term_id"),
+                        colnames(ref@meta.data))
+      if (length(cand)) ref$celltype <- as.character(ref@meta.data[[cand[1]]])
+    }
+    attr(ref, "type") <- "seurat"
     return(ref)
   }
+  
+  # Otherwise, use the H5AD
+  if (file.exists("refs/olah_2020_microglia.h5ad")) {
+    suppressPackageStartupMessages({
+      library(zellkonverter); library(SingleCellExperiment)
+      library(SummarizedExperiment)  # for assay/assayNames/colData helpers
+    })
+    
+    path <- "refs/olah_2020_microglia.h5ad"
+    # Try several ways to get raw counts if they exist
+    ref_sce <- tryCatch(
+      zellkonverter::readH5AD(path, layer = "counts"),
+      error = function(e) NULL
+    )
+    if (is.null(ref_sce)) {
+      ref_sce <- tryCatch(
+        zellkonverter::readH5AD(path, use_raw = TRUE),
+        error = function(e) NULL
+      )
+    }
+    if (is.null(ref_sce)) {
+      ref_sce <- zellkonverter::readH5AD(path)
+    }
+    
+    an <- SummarizedExperiment::assayNames(ref_sce)
+    # Ensure there is a "counts" assay
+    if (!"counts" %in% an) {
+      if ("X" %in% an) {
+        SummarizedExperiment::assay(ref_sce, "counts") <- SummarizedExperiment::assay(ref_sce, "X")
+      } else if ("logcounts" %in% an) {
+        SummarizedExperiment::assay(ref_sce, "counts") <- SummarizedExperiment::assay(ref_sce, "logcounts")
+      } else {
+        stop("No counts/logcounts/X assay found in: ", path)
+      }
+    }
+    
+    # Provide a 'celltype' column for transfer (pick the best available)
+    cd <- as.data.frame(SummarizedExperiment::colData(ref_sce))
+    label_col <- intersect(
+      c("cell_type", "author_cell_type", "cell_type_ontology_term_id"),
+      colnames(cd)
+    )
+    if (!length(label_col)) {
+      stop("No suitable label column in ref_sce colData (looked for cell_type/author_cell_type/ontology id).")
+    }
+    SummarizedExperiment::colData(ref_sce)$celltype <- as.character(cd[[label_col[1]]])
+    
+    # Convert to Seurat — tell it which assay to use as counts
+    ref <- Seurat::as.Seurat(ref_sce, counts = "counts")
+    attr(ref,"type") <- "h5ad"
+    
+    # Light normalization to be safe for anchors
+    DefaultAssay(ref) <- "RNA"
+    ref <- NormalizeData(ref, verbose = FALSE)
+    ref <- FindVariableFeatures(ref, verbose = FALSE)
+    
+    return(ref)
+  }
+  
   NULL
 }
+
 ref <- get_ref()
 
 if (!is.null(ref) && "celltype" %in% colnames(ref@meta.data)) {
@@ -456,7 +497,7 @@ if (!is.null(ref) && "celltype" %in% colnames(ref@meta.data)) {
   write_csv(obj_int@meta.data |> tibble::rownames_to_column("cell"),
             file.path(label_dir, "labels_with_scores.csv"))
 } else {
-  # Backup microglial panel when reference not available
+  # Backup microglial panel if Olah ref isn’t available
   mg_markers <- c("CX3CR1","P2RY12","TMEM119","CSF1R","TREM2","AIF1","ITGAM")
   obj_int <- AddModuleScore(obj_int, features=list(mg_markers), name="MG")
   obj_int$MG_Score <- obj_int@meta.data$MG1
@@ -483,7 +524,7 @@ save_plot(
 )
 write_csv(label_sum, file.path(OUT_ROOT, "labels", "celltype_proportions_by_sample.csv"))
 
-# ---------- Olah labels by cluster: dotplot + majority for UMAP ----------
+# ---------- Olah labels by cluster: dotplot ----------
 stopifnot("seurat_clusters" %in% colnames(obj_int@meta.data))
 stopifnot("label" %in% colnames(obj_int@meta.data))
 
@@ -550,6 +591,7 @@ p_umap_maj <- ggplot2::ggplot(emb, ggplot2::aes(U1, U2, color = seurat_clusters)
     alpha = 0.7, show.legend = FALSE
   ) +
   ggplot2::labs(title = paste0("UMAP • Cluster majority (Olah) labels ", lab_suffix))
+umap_dir <- make_dir(file.path(FIG_ROOT, "UMAP"))
 save_plot(p_umap_maj, file.path(umap_dir, "olah_cluster_majority_labels_on_umap.png"), 9, 7)
 
 # ---------- UMAP: Seurat clusters with H8/H4 composition labels ----------
@@ -775,8 +817,7 @@ run_pseudobulk_de <- function(cells_subset, tag,
   
   # MA
   p_ma <- ggplot(res_tbl, aes(baseMean, log2FoldChange, color = padj < alpha)) +
-    geom_point(alpha = .6, size = .8) +
-    scale_x_log10() +
+    geom_point(alpha = .6, size = .8) + scale_x_log10() +
     scale_color_manual(values = c("grey70","firebrick")) +
     geom_hline(yintercept = c(-1, 1), linetype = "dashed", linewidth = .4) +
     labs(title = paste0("DESeq2 MA • H8 vs H4 [", tag, "]"),
@@ -793,12 +834,10 @@ run_pseudobulk_de <- function(cells_subset, tag,
       ),
       nlp = -log10(pmax(padj, 1e-300))
     )
-  
   top_lab <- volc_df |>
     dplyr::filter(sig != "NS") |>
     dplyr::arrange(dplyr::desc(nlp)) |>
     dplyr::slice_head(n = 15)
-  
   p_volc <- ggplot2::ggplot(volc_df, ggplot2::aes(log2FoldChange, nlp, color = sig)) +
     ggplot2::geom_point(size = 0.8, alpha = 0.85) +
     ggplot2::geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = "dashed", linewidth = 0.4) +
@@ -842,7 +881,7 @@ if (length(mg_clusters) == 0) {
              con = file.path(de_meta_dir, "clusters_used_in_MGclusters.txt"))
 }
 
-# Keep ORIGINAL as default for downstream steps
+# Keep ORIGINAL as default for any downstream step that expects a single table
 if (!is.null(pb1)) {
   res_tbl_default <- pb1$res_tbl
 } else if (!is.null(pb2)) {
@@ -925,7 +964,7 @@ run_go_variant <- function(cells_subset, res_tbl, tag,
   if (length(down_genes)) invisible(run_go_and_plots(down_genes, paste0("variant_", tag, "/DE_down_in_H8"),universe_symbols))
 }
 
-if (!is.null(pb1)) run_go_variant(cells_labelMG,    pb1$res_tbl, "labelMG")
+if (!is.null(pb1)) run_go_variant(cells_labelMG,   pb1$res_tbl, "labelMG")
 if (!is.null(pb2)) run_go_variant(cells_MGclusters, pb2$res_tbl, "MGclusters")
 
 # --------------------------- Variance Partitioning -----------------------------

@@ -1,148 +1,105 @@
 #!/usr/bin/env Rscript
-# =============================================================================
-# Setup script for iPSC-microglia scRNA-seq pipeline
-# Installs core + optional CRAN/Bioconductor packages
-# Added: glmGamPoi (fast SCT) and ashr (LFC shrinker fallback)
-# =============================================================================
 
-message("\n==> Using R ", getRversion(), " on ", R.version$platform)
+# =========================
+# Setup for scRNA pipeline
+# - Installs CRAN, Bioconductor, and GitHub deps
+# - Adds m3addon (v3 DoubletFinder helpers)
+# =========================
 
-# --- helpers ------------------------------------------------------------------
-cran_repo <- getOption("repos")
-if (is.null(cran_repo) || is.na(cran_repo["CRAN"]) || cran_repo["CRAN"] == "@CRAN@") {
-  options(repos = c(CRAN = "https://cloud.r-project.org"))
-}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(Ncpus = max(1L, parallel::detectCores() - 1L))
+options(timeout = max(300, getOption("timeout", 60)))
 
-np <- getOption("Ncpus", 1L)
-if (is.null(np) || is.na(np) || !is.numeric(np)) np <- 1L
-message("Will use Ncpus = ", np)
+msg <- function(...) cat(sprintf("[setup %s] %s\n", format(Sys.time(), "%H:%M:%S"), paste0(..., collapse=" ")))
 
-install_if_missing_cran <- function(pkgs) {
-  pkgs <- setdiff(pkgs, rownames(installed.packages()))
-  if (length(pkgs)) {
-    message("\nInstalling CRAN packages: ", paste(pkgs, collapse=", "))
-    install.packages(pkgs, Ncpus = np, quiet = TRUE)
-  } else {
-    message("\nAll requested CRAN packages already installed.")
+install_if_missing <- function(pkgs) {
+  inst <- installed.packages()[, "Package"]
+  need <- setdiff(pkgs, inst)
+  if (length(need)) {
+    msg("Installing CRAN packages: ", paste(need, collapse = ", "))
+    install.packages(need, dependencies = TRUE)
   }
 }
 
-ensure_biocmanager <- function() {
-  if (!requireNamespace("BiocManager", quietly = TRUE)) {
-    install.packages("BiocManager", Ncpus = np, quiet = TRUE)
-  }
-  suppressPackageStartupMessages(library(BiocManager))
-}
-
-install_if_missing_bioc <- function(pkgs) {
-  ensure_biocmanager()
-  pkgs <- setdiff(pkgs, rownames(installed.packages()))
-  if (length(pkgs)) {
-    message("\nInstalling Bioconductor packages: ", paste(pkgs, collapse=", "))
-    BiocManager::install(pkgs, Ncpus = np, ask = FALSE, update = TRUE)
-  } else {
-    message("\nAll requested Bioconductor packages already installed.")
+install_bioc_if_missing <- function(pkgs) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  inst <- installed.packages()[, "Package"]
+  need <- setdiff(pkgs, inst)
+  if (length(need)) {
+    msg("Installing Bioconductor packages: ", paste(need, collapse = ", "))
+    BiocManager::install(need, update = FALSE, ask = FALSE)
   }
 }
 
-install_doubletfinder <- function() {
-  # DoubletFinder is sometimes on CRAN; if not, fall back to GitHub
-  if (!requireNamespace("DoubletFinder", quietly = TRUE)) {
-    message("\nInstalling DoubletFinder (GitHub fallback)...")
-    if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes", quiet = TRUE)
-    tryCatch(
-      remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", upgrade = "never", Ncpus = np),
-      error = function(e) {
-        message("  - GitHub install failed: ", conditionMessage(e))
-      }
-    )
-  }
-}
-
-# --- packages -----------------------------------------------------------------
-
-cran_core <- c(
-  # Seurat + friends
-  "Seurat", "sctransform", "harmony",
-  # tidy / util
-  "Matrix", "dplyr", "purrr", "ggplot2", "ggrepel", "readr", "tidyr",
-  "stringr", "tibble", "scales", "magrittr",
-  # conflicts resolver
-  "conflicted",         # <— added
-  # stats / modeling
-  "glmnet", "pROC", "DirichletReg",
-  # plotting helpers possibly used by enrichplot
-  "ggraph", "igraph",
-  # infra
-  "future",
-  # msigdbr lives on CRAN
-  "msigdbr",
-  # LFC shrinker fallback (CRAN)
-  "ashr"
+# ---------------- CRAN ----------------
+cran_pkgs <- c(
+  "Seurat", "harmony", "Matrix", "dplyr", "purrr", "ggplot2", "ggrepel",
+  "readr", "tidyr", "stringr", "glmnet", "pROC", "DirichletReg",
+  "future", "conflicted", "magrittr", "remotes"
 )
+install_if_missing(cran_pkgs)
 
-
-cran_optional <- c(
-  "patchwork", "cowplot", "fastDummies"
+# ---------------- Bioconductor ----------------
+bioc_pkgs <- c(
+  "DESeq2", "fgsea", "org.Hs.eg.db", "clusterProfiler", "enrichplot",
+  "variancePartition", "edgeR", "limma", "SingleCellExperiment",
+  "zellkonverter", "GO.db", "glmGamPoi", "Biobase", "SummarizedExperiment", "batchelor"
 )
+install_bioc_if_missing(bioc_pkgs)
 
-bioc_core <- c(
-  # DE + RNA-seq
-  "DESeq2", "edgeR", "limma",
-  # shrinker (preferred)
-  "apeglm",
-  # fast GLM for SCTransform v2
-  "glmGamPoi",
-  # GSEA / enrichment
-  "fgsea", "clusterProfiler", "enrichplot", "DOSE",
-  # annotation
-  "org.Hs.eg.db", "GO.db",
-  # variance partitioning
-  "variancePartition", "BiocParallel",
-  # single-cell containers / label transfer support
-  "SingleCellExperiment", "zellkonverter",
-  # ambient RNA (optional in pipeline flags)
-  "SoupX"
-)
+# ---------------- Optional shrinkers ----------------
+# apeglm (Bioc) + ashr (CRAN)
+install_bioc_if_missing("apeglm")
+install_if_missing("ashr")
 
-# --- install ------------------------------------------------------------------
-install_if_missing_cran(cran_core)
-install_if_missing_cran(cran_optional)
-install_if_missing_bioc(bioc_core)
-install_doubletfinder()
+# ---------------- DoubletFinder + m3addon ----------------
+if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
 
-# --- quick load test & report -------------------------------------------------
-pkgs_test <- c(
-  cran_core,
-  "DoubletFinder",
-  bioc_core
-)
+#Monocle3 dependencies
+BiocManager::install(c('BiocGenerics', 'DelayedArray', 'DelayedMatrixStats',
+                       'limma', 'lme4', 'S4Vectors', 'SingleCellExperiment',
+                       'SummarizedExperiment', 'batchelor', 'HDF5Array',
+                       'ggrastr'))
 
-loaded <- vapply(pkgs_test, function(p) {
-  suppressWarnings(suppressPackageStartupMessages(require(p, character.only = TRUE)))
-}, logical(1))
+#BPCells package
+remotes::install_github("bnprks/BPCells/r")
 
-message("\nLoad summary:")
-print(sort(loaded))
+#Batchelor - required by m3addon, in bioc_pkgs above
 
-if (!all(loaded)) {
-  not_loaded <- names(loaded)[!loaded]
-  message("\nThe following packages failed to load. You can re-run the script or install them manually:\n  - ",
-          paste(not_loaded, collapse = "\n  - "))
-} else {
-  message("\nAll requested packages loaded successfully.")
+#Monocle3 
+devtools::install_github('cole-trapnell-lab/monocle3')
+
+# Install/refresh DoubletFinder (use GitHub to avoid old mirrors)
+try({
+  remotes::install_github("chris-mcginnis-ucsf/DoubletFinder",
+                          upgrade = "never", dependencies = TRUE)
+}, silent = TRUE)
+
+# Install m3addon (exposes paramSweep_v3/doubletFinder_v3 in some forks)
+if (!requireNamespace("m3addon", quietly = TRUE)) {
+  remotes::install_github("scfurl/m3addon", upgrade = "never", dependencies = TRUE)
 }
 
-# --- Bioconductor sanity check (optional) -------------------------------------
-if (requireNamespace("BiocManager", quietly = TRUE)) {
-  v <- tryCatch(BiocManager::valid(), error = function(e) e)
-  if (inherits(v, "error")) {
-    message("\nBiocManager::valid() check skipped: ", conditionMessage(v))
-  } else {
-    message("\nBiocManager::valid() summary:")
-    print(v)
-  }
-}
+# ---------------- Sanity checks ----------------
+ok <- list(
+  DoubletFinder = requireNamespace("DoubletFinder", quietly = TRUE),
+  m3addon       = requireNamespace("m3addon", quietly = TRUE)
+)
+msg("DF installed? ", ok$DoubletFinder, " | m3addon installed? ", ok$m3addon)
 
-message("\nSetup complete.")
-# =============================================================================
+# Probe for helper availability
+probe <- function(pkg, fn) {
+  if (!requireNamespace(pkg, quietly = TRUE)) return(FALSE)
+  exists(fn, envir = asNamespace(pkg), inherits = FALSE)
+}
+report <- c(
+  DF_paramSweep_v3   = probe("DoubletFinder", "paramSweep_v3"),
+  DF_doubletFinder_v3= probe("DoubletFinder", "doubletFinder_v3"),
+  M3_paramSweep_v3   = probe("m3addon",       "paramSweep_v3"),
+  M3_doubletFinder_v3= probe("m3addon",       "doubletFinder_v3"),
+  DF_paramSweep      = probe("DoubletFinder", "paramSweep"),
+  DF_doubletFinder   = probe("DoubletFinder", "doubletFinder")
+)
+print(report)
+
+msg("Setup complete.")
