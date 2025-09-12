@@ -37,7 +37,6 @@ suppressPackageStartupMessages({
   library(conflicted)
   suppressWarnings(requireNamespace("glmGamPoi", quietly = TRUE))
   suppressPackageStartupMessages(library(magrittr))
-  # Prefer to **not** attach m3addon; we’ll requireNamespace() it dynamically
 })
 
 # ------------------------------ Conflicts prefs --------------------------------
@@ -56,7 +55,6 @@ plan(sequential)
 options(future.globals.maxSize = 8 * 1024^3)  # 8 GB
 
 # ------------------------------ Console-only logging ---------------------------
-
 log_msg <- function(...) cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"), paste0(..., collapse = " ")))
 .run_started_at <- Sys.time()
 log_msg("=== Pipeline started (console only) ===")
@@ -192,7 +190,7 @@ have_M3   <- requireNamespace("m3addon", quietly = TRUE)
 have_Soup <- requireNamespace("SoupX", quietly = TRUE)
 have_zell <- requireNamespace("zellkonverter", quietly = TRUE) &&
   requireNamespace("SingleCellExperiment", quietly = TRUE)
-RUN_DOUBLETS <- TRUE
+RUN_DOUBLETS <- FALSE #turning doublet finder off for now due to issues with m3addon / monocle3
 RUN_SOUPX    <- FALSE
 RUN_BULK_OPT <- FALSE
 
@@ -224,62 +222,89 @@ load_one <- function(path, nm){
 log_msg("Loading microglia samples..."); seur_list <- purrr::imap(PATHS, load_one)
 log_msg("Loading HEK controls...");      hek_list  <- purrr::imap(PATHS_HEK, load_one)
 
-# --- Doublet helpers (prefer m3addon v3, fall back to DF legacy) ---
+# ---------------------- Doublet detection (fixed for Seurat) -------------------
 exists_ns <- function(pkg, fun) {
   requireNamespace(pkg, quietly = TRUE) && exists(fun, envir = asNamespace(pkg), inherits = FALSE)
 }
+formals_has <- function(f, arg) { is.function(f) && arg %in% names(formals(f)) }
 
-if (RUN_DOUBLETS && (requireNamespace("m3addon", quietly = TRUE) || requireNamespace("DoubletFinder", quietly = TRUE))) {
-  log_msg("Running Doublet detection (using m3addon v3 if available)…")
-  
-  # v3 where available
-  if (exists_ns("m3addon", "paramSweep_v3") && exists_ns("m3addon", "doubletFinder_v3")) {
-    df_paramSweep    <- m3addon::paramSweep_v3
-    df_doubletFinder <- m3addon::doubletFinder_v3
-    backend_main <- "m3addon (v3)"
-  } else if (exists_ns("DoubletFinder", "paramSweep_v3") && exists_ns("DoubletFinder", "doubletFinder_v3")) {
-    df_paramSweep    <- DoubletFinder::paramSweep_v3
-    df_doubletFinder <- DoubletFinder::doubletFinder_v3
-    backend_main <- "DoubletFinder (v3)"
-  } else if (exists_ns("DoubletFinder", "paramSweep") && exists_ns("DoubletFinder", "doubletFinder")) {
+have_DF <- requireNamespace("DoubletFinder", quietly = TRUE)
+have_M3 <- requireNamespace("m3addon", quietly = TRUE) # present but we won't use it for Seurat
+
+if (RUN_DOUBLETS && have_DF) {
+  # Prefer DoubletFinder legacy (Seurat API). Only use a backend whose formals contain 'seu'.
+  if (exists_ns("DoubletFinder","paramSweep") && exists_ns("DoubletFinder","doubletFinder") &&
+      formals_has(DoubletFinder::doubletFinder, "seu")) {
     df_paramSweep    <- DoubletFinder::paramSweep
     df_doubletFinder <- DoubletFinder::doubletFinder
-    backend_main <- "DoubletFinder (legacy)"
+    backend_main <- "DoubletFinder (legacy, Seurat)"
+  } else if (exists_ns("DoubletFinder","paramSweep_v3") && exists_ns("DoubletFinder","doubletFinder_v3") &&
+             formals_has(DoubletFinder::doubletFinder_v3, "seu")) {
+    df_paramSweep    <- DoubletFinder::paramSweep_v3
+    df_doubletFinder <- DoubletFinder::doubletFinder_v3
+    backend_main <- "DoubletFinder (v3, Seurat)"
   } else {
-    log_msg("Doublet detection skipped: no compatible helpers found.")
+    df_paramSweep <- df_doubletFinder <- NULL
     backend_main <- NULL
   }
+  # we never call m3addon here because its v3 expects 'cds' not 'seu'
   
-  # always from DoubletFinder (these aren’t in m3addon)
   df_summarizeSweep <- if (exists_ns("DoubletFinder", "summarizeSweep")) DoubletFinder::summarizeSweep else NULL
   df_findpK         <- if (exists_ns("DoubletFinder", "find.pK"))         DoubletFinder::find.pK         else NULL
-  
-  log_msg(sprintf("Doublet backend: %s; summarizeSweep: %s; find.pK: %s",
+  message(sprintf("[Doublets] Backend: %s; summarizeSweep: %s; find.pK: %s",
                   ifelse(is.null(backend_main), "none", backend_main),
                   ifelse(is.null(df_summarizeSweep), "missing", "OK"),
                   ifelse(is.null(df_findpK), "missing", "OK")))
   
   if (!is.null(backend_main) && !is.null(df_summarizeSweep) && !is.null(df_findpK)) {
-    # … keep the existing per-sample loop unchanged …
+    seur_list <- lapply(seur_list, function(obj){
+      DefaultAssay(obj) <- "RNA"
+      obj <- NormalizeData(obj, verbose=FALSE) |>
+        FindVariableFeatures(verbose=FALSE) |>
+        ScaleData(verbose=FALSE) |>
+        RunPCA(npcs=30, verbose=FALSE)
+      
+      # Parameter sweep (tolerant)
+      sweep.res <- tryCatch(df_paramSweep(obj, PCs=1:20, sct=FALSE, num.cores=1),
+                            error=function(e) { message("paramSweep failed: ", e$message); NULL })
+      pk <- 0.01
+      if (!is.null(sweep.res)) {
+        sweep.stats <- df_summarizeSweep(sweep.res, GT=FALSE)
+        pk_tbl <- tryCatch(df_findpK(sweep.stats), error=function(e) NULL)
+        if (!is.null(pk_tbl) && "BCmetric" %in% names(pk_tbl)) {
+          pk_try <- suppressWarnings(as.numeric(as.character(pk_tbl$pK[which.max(pk_tbl$BCmetric)])))
+          if (!is.na(pk_try)) pk <- pk_try
+        }
+      }
+      nExp <- round(ncol(obj)*0.05)
+      df_args <- list(seu=obj, PCs=1:20, pN=0.25, pK=pk, nExp=nExp, reuse.pANN=FALSE, sct=FALSE)
+      obj <- tryCatch(do.call(df_doubletFinder, df_args),
+                      error=function(e){ message("doubletFinder failed: ", e$message); obj })
+      df_col <- grep("DF.classifications", colnames(obj@meta.data), value=TRUE)
+      obj$doublet <- if (length(df_col)) obj@meta.data[[df_col[1]]] else NA
+      obj
+    })
   } else {
-    log_msg("Doublet detection disabled due to missing components.")
+    message("[Doublets] Skipped: no compatible DoubletFinder Seurat backend available.")
   }
 } else if (RUN_DOUBLETS) {
-  log_msg("Doublet detection skipped: neither m3addon nor DoubletFinder is installed.")
+  message("[Doublets] Skipped: DoubletFinder not installed.")
 }
 
 
-if (RUN_SOUPX && have_Soup){
-  log_msg("Running SoupX (placeholder: requires raw droplets). Skipping.")
-}
 
 # --------------------------- Merge --------------------------------------------
 log_msg("Merging...")
 obj_mg  <- Reduce(function(a,b) merge(a,b), seur_list)
 obj_hek <- Reduce(function(a,b) merge(a,b), hek_list)
 obj_all <- merge(obj_mg, obj_hek)
-if (!"percent.mt" %in% colnames(obj_all@meta.data)) obj_all[["percent.mt"]] <- PercentageFeatureSet(obj_all, pattern="^MT-")
-if ("doublet" %in% colnames(obj_mg@meta.data)){ keep <- colnames(obj_mg)[obj_mg$doublet!="Doublet"]; obj_mg <- obj_mg[, keep]; log_msg("Removed doublets; remaining:", ncol(obj_mg)) }
+if (!"percent.mt" %in% colnames(obj_all@meta.data)) {
+  obj_all[["percent.mt"]] <- PercentageFeatureSet(obj_all, pattern="^MT-")
+}
+if ("doublet" %in% colnames(obj_mg@meta.data)){
+  keep <- colnames(obj_mg)[obj_mg$doublet!="Doublet"]
+  obj_mg <- obj_mg[, keep]; log_msg("Removed doublets; remaining:", ncol(obj_mg))
+}
 
 # --------------------------- HEK QC mini-panel --------------------------------
 make_dir(file.path(FIG_ROOT, "HEK_QC"))
@@ -412,11 +437,10 @@ label_dir <- make_dir(file.path(OUT_ROOT, "labels"))
 DefaultAssay(obj_int) <- int_assay
 
 get_ref <- function() {
-  # Prefer a Seurat RDS if you have one
+  # Prefer a ready-made Seurat reference if present
   if (file.exists("refs/microglia_ref_seurat.rds")) {
     ref <- readRDS("refs/microglia_ref_seurat.rds")
     if (!"celltype" %in% colnames(ref@meta.data)) {
-      # try to derive a celltype if missing
       cand <- intersect(c("author_cell_type","cell_type","cell_type_ontology_term_id"),
                         colnames(ref@meta.data))
       if (length(cand)) ref$celltype <- as.character(ref@meta.data[[cand[1]]])
@@ -424,75 +448,65 @@ get_ref <- function() {
     attr(ref, "type") <- "seurat"
     return(ref)
   }
+  if (!file.exists("refs/olah_2020_microglia.h5ad")) return(NULL)
   
-  # Otherwise, use the H5AD
-  if (file.exists("refs/olah_2020_microglia.h5ad")) {
-    suppressPackageStartupMessages({
-      library(zellkonverter); library(SingleCellExperiment)
-      library(SummarizedExperiment)  # for assay/assayNames/colData helpers
-    })
-    
-    path <- "refs/olah_2020_microglia.h5ad"
-    # Try several ways to get raw counts if they exist
-    ref_sce <- tryCatch(
-      zellkonverter::readH5AD(path, layer = "counts"),
-      error = function(e) NULL
-    )
-    if (is.null(ref_sce)) {
-      ref_sce <- tryCatch(
-        zellkonverter::readH5AD(path, use_raw = TRUE),
-        error = function(e) NULL
-      )
-    }
-    if (is.null(ref_sce)) {
-      ref_sce <- zellkonverter::readH5AD(path)
-    }
-    
-    an <- SummarizedExperiment::assayNames(ref_sce)
-    # Ensure there is a "counts" assay
-    if (!"counts" %in% an) {
-      if ("X" %in% an) {
-        SummarizedExperiment::assay(ref_sce, "counts") <- SummarizedExperiment::assay(ref_sce, "X")
-      } else if ("logcounts" %in% an) {
-        SummarizedExperiment::assay(ref_sce, "counts") <- SummarizedExperiment::assay(ref_sce, "logcounts")
-      } else {
-        stop("No counts/logcounts/X assay found in: ", path)
-      }
-    }
-    
-    # Provide a 'celltype' column for transfer (pick the best available)
-    cd <- as.data.frame(SummarizedExperiment::colData(ref_sce))
-    label_col <- intersect(
-      c("cell_type", "author_cell_type", "cell_type_ontology_term_id"),
-      colnames(cd)
-    )
-    if (!length(label_col)) {
-      stop("No suitable label column in ref_sce colData (looked for cell_type/author_cell_type/ontology id).")
-    }
-    SummarizedExperiment::colData(ref_sce)$celltype <- as.character(cd[[label_col[1]]])
-    
-    # Convert to Seurat — tell it which assay to use as counts
-    ref <- Seurat::as.Seurat(ref_sce, counts = "counts")
-    attr(ref,"type") <- "h5ad"
-    
-    # Light normalization to be safe for anchors
-    DefaultAssay(ref) <- "RNA"
-    ref <- NormalizeData(ref, verbose = FALSE)
-    ref <- FindVariableFeatures(ref, verbose = FALSE)
-    
-    return(ref)
-  }
+  suppressPackageStartupMessages({
+    library(zellkonverter)
+    library(SingleCellExperiment)
+    library(SummarizedExperiment)
+    library(Matrix)
+    library(Seurat)
+  })
+  sce <- zellkonverter::readH5AD("refs/olah_2020_microglia.h5ad")
   
-  NULL
+  # Pick a counts-like assay (this file uses "X")
+  an <- SummarizedExperiment::assayNames(sce)
+  mat_name <- if ("counts" %in% an) "counts" else if ("X" %in% an) "X"
+  else if ("logcounts" %in% an) "logcounts"
+  else stop("Reference SCE has no 'counts', 'X', or 'logcounts' assay.")
+  M <- SummarizedExperiment::assay(sce, mat_name)
+  if (!inherits(M, "dgCMatrix")) M <- as(M, "dgCMatrix")
+  
+  # Map to symbols (aggregate duplicates without Matrix.utils)
+  rd <- as.data.frame(SummarizedExperiment::rowData(sce))
+  sym <- if ("feature_name" %in% names(rd)) as.character(rd$feature_name) else rownames(sce)
+  sym[is.na(sym) | sym == ""] <- rownames(sce)[is.na(sym) | sym == ""]
+  f <- factor(sym, levels = unique(sym))
+  G <- Matrix::sparseMatrix(i = seq_along(f), j = as.integer(f), x = 1,
+                            dims = c(length(f), nlevels(f)))
+  M_sym <- Matrix::t(G) %*% M
+  rownames(M_sym) <- levels(f); colnames(M_sym) <- colnames(M)
+  
+  ref <- Seurat::CreateSeuratObject(counts = M_sym, assay = "RNA")
+  Seurat::DefaultAssay(ref) <- "RNA"
+  
+  cd <- as.data.frame(SummarizedExperiment::colData(sce))
+  labc <- intersect(c("author_cell_type","cell_type","cell_type_ontology_term_id"), names(cd))
+  ref$celltype <- if (length(labc)) as.character(cd[[labc[1]]]) else "unknown"
+  
+  ref <- Seurat::NormalizeData(ref, verbose = FALSE)
+  ref <- Seurat::FindVariableFeatures(ref, verbose = FALSE)
+  attr(ref, "type") <- "h5ad"
+  ref
 }
 
 ref <- get_ref()
 
 if (!is.null(ref) && "celltype" %in% colnames(ref@meta.data)) {
-  anchors_ref <- FindTransferAnchors(reference=ref, query=obj_int, normalization.method=norm_method)
-  preds <- TransferData(anchorset=anchors_ref, refdata=ref$celltype)
-  obj_int$label <- preds$predicted.id
+  trans_norm <- if ("SCT" %in% names(Seurat::Assays(ref)) &&
+                    "SCT" %in% names(Seurat::Assays(obj_int))) "SCT" else "LogNormalize"
+  anchors_ref <- Seurat::FindTransferAnchors(reference = ref, query = obj_int,
+                                             normalization.method = trans_norm)
+  preds <- Seurat::TransferData(anchorset = anchors_ref, refdata = ref$celltype)
+  
+  # Keep the original Olah label (fine-grained) in its own column
+  obj_int$olah_label  <- as.character(preds$predicted.id)
   obj_int$label_score <- preds$prediction.score.max
+  
+  # Binary MG-like + collapsed label for downstream analyses
+  obj_int$mg_like <- grepl("microglia", obj_int$olah_label, ignore.case = TRUE)
+  obj_int$label   <- ifelse(obj_int$mg_like, "Microglia_like", "Non_MG_like")
+  
   saveRDS(obj_int, file.path(OUT_ROOT, "seurat_with_labels.rds"))
   write_csv(obj_int@meta.data |> tibble::rownames_to_column("cell"),
             file.path(label_dir, "labels_with_scores.csv"))
@@ -501,14 +515,16 @@ if (!is.null(ref) && "celltype" %in% colnames(ref@meta.data)) {
   mg_markers <- c("CX3CR1","P2RY12","TMEM119","CSF1R","TREM2","AIF1","ITGAM")
   obj_int <- AddModuleScore(obj_int, features=list(mg_markers), name="MG")
   obj_int$MG_Score <- obj_int@meta.data$MG1
-  obj_int$label <- ifelse(obj_int$MG_Score > quantile(obj_int$MG_Score, 0.4), "Microglia_like", "Non_MG_like")
+  obj_int$label    <- ifelse(obj_int$MG_Score > quantile(obj_int$MG_Score, 0.4),
+                             "Microglia_like", "Non_MG_like")
+  obj_int$mg_like  <- obj_int$label == "Microglia_like"
   obj_int$label_score <- scales::rescale(obj_int$MG_Score)
   saveRDS(obj_int, file.path(OUT_ROOT, "seurat_with_labels_coarse.rds"))
   write_csv(obj_int@meta.data |> tibble::rownames_to_column("cell"),
             file.path(label_dir, "labels_coarse_scores.csv"))
 }
 
-# Composition stacks
+# Composition stacks (collapsed label)
 label_sum <- obj_int@meta.data |>
   tibble::as_tibble() |>
   group_by(sample, harvest, label) |>
@@ -524,17 +540,17 @@ save_plot(
 )
 write_csv(label_sum, file.path(OUT_ROOT, "labels", "celltype_proportions_by_sample.csv"))
 
-# ---------- Olah labels by cluster: dotplot ----------
+# ---------- Labels by cluster: use Olah fine labels if present ----------
 stopifnot("seurat_clusters" %in% colnames(obj_int@meta.data))
-stopifnot("label" %in% colnames(obj_int@meta.data))
+visual_label_col <- if ("olah_label" %in% colnames(obj_int@meta.data)) "olah_label" else "label"
 
 meta_df <- obj_int@meta.data |>
   tibble::as_tibble(rownames = "cell") |>
   dplyr::mutate(seurat_clusters = as.character(.data$seurat_clusters),
-                label = as.character(.data$label))
+                visual_label    = as.character(.data[[visual_label_col]]))
 
 lab_counts <- meta_df |>
-  dplyr::count(seurat_clusters, label, name = "n") |>
+  dplyr::count(seurat_clusters, visual_label, name = "n") |>
   dplyr::group_by(seurat_clusters) |>
   dplyr::mutate(frac = n / sum(n)) |>
   dplyr::ungroup()
@@ -543,20 +559,21 @@ maj_labels <- lab_counts |>
   dplyr::group_by(seurat_clusters) |>
   dplyr::slice_max(frac, n = 1, with_ties = FALSE) |>
   dplyr::ungroup() |>
-  dplyr::transmute(seurat_clusters, maj_label = as.character(label))
+  dplyr::transmute(seurat_clusters, maj_label = as.character(visual_label))
 
 p_dot_lab <- ggplot2::ggplot(lab_counts,
-                             ggplot2::aes(x = seurat_clusters, y = label, size = frac, fill = frac)) +
+                             ggplot2::aes(x = seurat_clusters, y = visual_label, size = frac, fill = frac)) +
   ggplot2::geom_point(shape = 21, alpha = 0.95, color = "grey20", stroke = 0.2) +
   ggplot2::scale_size(range = c(1.5, 8), breaks = c(0.1, 0.25, 0.5, 0.75, 1.0)) +
   ggplot2::scale_fill_gradient(low = "white", high = "firebrick") +
   theme_basic() +
-  ggplot2::labs(title = "Olah label distribution by cluster",
-                x = "Cluster", y = "Transferred label", size = "Frac", fill = "Frac")
+  ggplot2::labs(title = if (visual_label_col=="olah_label") "Olah label distribution by cluster"
+                else "Label distribution by cluster (coarse)",
+                x = "Cluster", y = "Label", size = "Frac", fill = "Frac")
 celltypes_dir <- make_dir(file.path(FIG_ROOT, "Celltypes"))
-save_plot(p_dot_lab, file.path(celltypes_dir, "olah_labels_by_cluster_dotplot.png"), 10, 8)
+save_plot(p_dot_lab, file.path(celltypes_dir, "labels_by_cluster_dotplot.png"), 10, 8)
 
-# ---------- UMAP with majority Olah label per cluster ----------
+# ---------- UMAP with majority labels per cluster ----------
 umap_mat  <- Seurat::Embeddings(obj_int, "umap")
 stopifnot(!is.null(dim(umap_mat)), ncol(umap_mat) >= 2)
 umap_cols <- colnames(umap_mat)[1:2]
@@ -590,9 +607,9 @@ p_umap_maj <- ggplot2::ggplot(emb, ggplot2::aes(U1, U2, color = seurat_clusters)
     color = "white", size = 3, label.size = 0.2, segment.size = 0.2,
     alpha = 0.7, show.legend = FALSE
   ) +
-  ggplot2::labs(title = paste0("UMAP • Cluster majority (Olah) labels ", lab_suffix))
+  ggplot2::labs(title = paste0("UMAP • Cluster majority labels ", lab_suffix))
 umap_dir <- make_dir(file.path(FIG_ROOT, "UMAP"))
-save_plot(p_umap_maj, file.path(umap_dir, "olah_cluster_majority_labels_on_umap.png"), 9, 7)
+save_plot(p_umap_maj, file.path(umap_dir, "cluster_majority_labels_on_umap.png"), 9, 7)
 
 # ---------- UMAP: Seurat clusters with H8/H4 composition labels ----------
 emb2 <- as.data.frame(umap_mat) |>
@@ -753,12 +770,10 @@ run_pseudobulk_de <- function(cells_subset, tag,
                               out_dir = file.path(OUT_ROOT, "deseq2"),
                               fig_dir = file.path(FIG_ROOT, "DE"),
                               alpha = 0.05, lfc_thr = 1) {
-  
   if (length(cells_subset) < 100) {
     log_msg("[", tag, "] Too few cells (", length(cells_subset), "); skipping.")
     return(NULL)
   }
-  
   pb <- AggregateExpression(
     obj_int[, cells_subset],
     group.by = c("culture","harvest"),
@@ -807,14 +822,11 @@ run_pseudobulk_de <- function(cells_subset, tag,
     tibble::rownames_to_column("gene") |>
     dplyr::arrange(padj)
   
-  # Save table
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   out_csv <- file.path(out_dir, paste0("pseudobulk_H8_vs_H4_", tag, ".csv"))
   readr::write_csv(res_tbl, out_csv)
   
-  # Plots
   dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
-  
   # MA
   p_ma <- ggplot(res_tbl, aes(baseMean, log2FoldChange, color = padj < alpha)) +
     geom_point(alpha = .6, size = .8) + scale_x_log10() +
@@ -823,8 +835,7 @@ run_pseudobulk_de <- function(cells_subset, tag,
     labs(title = paste0("DESeq2 MA • H8 vs H4 [", tag, "]"),
          x = "baseMean (log10)", y = "log2FC") + theme_basic()
   save_plot(p_ma, file.path(fig_dir, paste0("MA_", tag, ".png")), 7.5, 6)
-  
-  # Volcano (colored + top labels)
+  # Volcano
   volc_df <- res_tbl |>
     dplyr::mutate(
       sig = dplyr::case_when(
@@ -834,10 +845,7 @@ run_pseudobulk_de <- function(cells_subset, tag,
       ),
       nlp = -log10(pmax(padj, 1e-300))
     )
-  top_lab <- volc_df |>
-    dplyr::filter(sig != "NS") |>
-    dplyr::arrange(dplyr::desc(nlp)) |>
-    dplyr::slice_head(n = 15)
+  top_lab <- volc_df |> dplyr::filter(sig != "NS") |> dplyr::arrange(dplyr::desc(nlp)) |> dplyr::slice_head(n = 15)
   p_volc <- ggplot2::ggplot(volc_df, ggplot2::aes(log2FoldChange, nlp, color = sig)) +
     ggplot2::geom_point(size = 0.8, alpha = 0.85) +
     ggplot2::geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = "dashed", linewidth = 0.4) +
@@ -850,22 +858,20 @@ run_pseudobulk_de <- function(cells_subset, tag,
     ggplot2::labs(title = paste0("Volcano • H8 vs H4 [", tag, "]"),
                   x = "log2FC (H8/H4)", y = "-log10(FDR)", color = "")
   save_plot(p_volc, file.path(fig_dir, paste0("Volcano_labeled_", tag, ".png")), 8.5, 7)
-  
   list(res_tbl = res_tbl, coldata = coldata, pb = pb)
 }
 
-# Variant 1: ORIGINAL (label-based microglia)
-mg_labels <- c("Microglia","microglia","Microglia_like")
-cells_labelMG <- md2 |> dplyr::filter(label %in% mg_labels) |> dplyr::pull(cell)
+# Variant 1: ORIGINAL (MG-like cells via transferred Olah labels where available)
+cells_labelMG <- md2 |> dplyr::filter(isTRUE(mg_like)) |> dplyr::pull(cell)
 if (length(cells_labelMG) < 100) {
-  log_msg("[labelMG] Few MG-labelled cells; falling back to culture A/C/D regardless of label.")
+  log_msg("[labelMG] Few MG-like cells; falling back to culture A/C/D regardless of label.")
   cells_labelMG <- md2 |> dplyr::filter(!is.na(culture) & culture %in% c("A","C","D")) |> dplyr::pull(cell)
 }
 pb1 <- run_pseudobulk_de(cells_labelMG, tag = "labelMG")
 
-# Variant 2: MGclusters (clusters where ≥50% cells are microglia-labelled)
+# Variant 2: MGclusters (clusters where ≥50% cells are MG-like)
 cl_frac <- md2 |>
-  dplyr::mutate(is_mg = label %in% mg_labels) |>
+  dplyr::mutate(is_mg = isTRUE(mg_like)) |>
   dplyr::group_by(seurat_clusters) |>
   dplyr::summarise(frac_mg = mean(is_mg), n = dplyr::n(), .groups = "drop")
 mg_clusters <- cl_frac |> dplyr::filter(frac_mg >= 0.5) |> dplyr::pull(seurat_clusters)
@@ -881,7 +887,7 @@ if (length(mg_clusters) == 0) {
              con = file.path(de_meta_dir, "clusters_used_in_MGclusters.txt"))
 }
 
-# Keep ORIGINAL as default for any downstream step that expects a single table
+# Choose default DE table for downstream (prefer labelMG)
 if (!is.null(pb1)) {
   res_tbl_default <- pb1$res_tbl
 } else if (!is.null(pb2)) {
@@ -909,14 +915,11 @@ run_gsea_variant <- function(res_tbl, tag,
   genes_in_sets <- unique(unlist(hallmark, use.names = FALSE))
   res_rank <- res_rank %>% filter(gene %in% genes_in_sets)
   ranks <- res_rank$rank; names(ranks) <- res_rank$gene; ranks <- sort(ranks, decreasing=TRUE)
-  
   if (length(ranks) < 50) {
-    log_msg("[GSEA/", tag, "] Too few ranked genes (", length(ranks), "); skipping.")
-    return(NULL)
+    log_msg("[GSEA/", tag, "] Too few ranked genes (", length(ranks), "); skipping."); return(NULL)
   }
   fg <- fgsea(pathways=hallmark, stats=ranks, minSize=15, maxSize=500, nperm=5000)
   fg_tbl <- arrange(as_tibble(fg), padj)
-  
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
   write_csv(fg_tbl, file.path(out_dir, paste0("hallmark_fgsea_", tag, ".csv")))
@@ -928,13 +931,11 @@ run_gsea_variant <- function(res_tbl, tag,
   save_plot(p_gsea, file.path(fig_dir, paste0("hallmark_dotplot_", tag, ".png")), 8.5, 7)
   invisible(fg_tbl)
 }
-
 invisible(run_gsea_variant(if (!is.null(pb1)) pb1$res_tbl else NULL, "labelMG"))
 invisible(run_gsea_variant(if (!is.null(pb2)) pb2$res_tbl else NULL, "MGclusters"))
 
 # --------------------------- GO enrichment (TWO VARIANTS) ----------------------
 log_msg("GO enrichment: two variants (top100 H4/H8 + DE up/down)")
-
 run_go_variant <- function(cells_subset, res_tbl, tag,
                            alpha = 0.05, lfc_thr = 1) {
   if (is.null(res_tbl) || length(cells_subset) < 50) {
@@ -953,17 +954,14 @@ run_go_variant <- function(cells_subset, res_tbl, tag,
     genes_H4 <- head(rownames(avg_by_harvest[order(avg_by_harvest[,"H4"], decreasing=TRUE), , drop=FALSE]), 100)
     genes_H8 <- head(rownames(avg_by_harvest[order(avg_by_harvest[,"H8"], decreasing=TRUE), , drop=FALSE]), 100)
   }
-  
   up_genes   <- res_tbl |> dplyr::filter(!is.na(padj), padj < alpha, log2FoldChange >=  lfc_thr) |> dplyr::pull(gene) |> unique()
   down_genes <- res_tbl |> dplyr::filter(!is.na(padj), padj < alpha, log2FoldChange <= -lfc_thr) |> dplyr::pull(gene) |> unique()
   universe_symbols <- rownames(obj_int)
-  
   if (length(genes_H4))   invisible(run_go_and_plots(genes_H4,   paste0("variant_", tag, "/H4_top100"),    universe_symbols))
   if (length(genes_H8))   invisible(run_go_and_plots(genes_H8,   paste0("variant_", tag, "/H8_top100"),    universe_symbols))
   if (length(up_genes))   invisible(run_go_and_plots(up_genes,   paste0("variant_", tag, "/DE_up_in_H8"),  universe_symbols))
   if (length(down_genes)) invisible(run_go_and_plots(down_genes, paste0("variant_", tag, "/DE_down_in_H8"),universe_symbols))
 }
-
 if (!is.null(pb1)) run_go_variant(cells_labelMG,   pb1$res_tbl, "labelMG")
 if (!is.null(pb2)) run_go_variant(cells_MGclusters, pb2$res_tbl, "MGclusters")
 
@@ -978,7 +976,7 @@ if (!is.null(pb1) && !is.null(pb1$pb)) {
 } else {
   DefaultAssay(obj_int) <- "RNA"
   md <- obj_int@meta.data |> tibble::as_tibble(rownames="cell")
-  cells_fallback <- md |> dplyr::filter(label %in% mg_labels) |> dplyr::pull(cell)
+  cells_fallback <- md |> dplyr::filter(isTRUE(mg_like)) |> dplyr::pull(cell)
   pb_mat <- AggregateExpression(obj_int[, cells_fallback], group.by=c("culture","harvest"), assays="RNA", slot="counts")$RNA
   coldata <- tibble(sample=colnames(pb_mat)) |>
     tidyr::separate(sample, into=c("culture","harvest"), sep="_", remove=FALSE, extra="merge", fill="right") |>
