@@ -26,8 +26,8 @@
 │  └─ scrna_ipsc/
 │     ├─ scrna_pipeline.R          # your main pipeline
 │     ├─ setup_pipeline.R          # package installer
-│     └─ refs/
-│        └─ olah_2020_microglia.h5ad  # reference (can stay here, see “Refs” note)
+│- refs/
+│  └─ olah_2020_microglia.h5ad  # reference
 │
 ├─ results/                         # auto-created by the pipeline
 │  ├─ logs/                         # pipeline_YYYYMMDD_HHMMSS.log
